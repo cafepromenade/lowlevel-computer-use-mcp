@@ -75,6 +75,15 @@ try:
 except Exception:  # pragma: no cover
     Image = None
 
+# Win32 background-input / per-window capture / headless desktop (Windows only)
+try:
+    if os.name == "nt":
+        from . import winio
+    else:  # pragma: no cover
+        winio = None
+except Exception:  # pragma: no cover
+    winio = None
+
 
 # --------------------------------------------------------------------------- #
 # Server + constants
@@ -383,6 +392,17 @@ class ClickInput(BaseModel):
     interval: float = Field(
         default=0.0, description="Seconds between successive clicks", ge=0, le=5
     )
+    hwnd: Optional[int] = Field(
+        default=None,
+        description="BACKGROUND TARGET: native window handle. When set, the click is "
+        "posted to that window via Win32 messages WITHOUT focusing it, and x/y are "
+        "treated as CLIENT coordinates relative to that window.",
+    )
+    window_title: Optional[str] = Field(
+        default=None,
+        description="BACKGROUND TARGET by title (substring). Like hwnd but resolves the "
+        "top-level window by title; x/y are client coordinates of that window.",
+    )
 
 
 @mcp.tool(
@@ -401,12 +421,32 @@ async def mouse_click(params: ClickInput) -> str:
     Use clicks=2 for a double-click. If x/y are omitted the click happens at the
     current cursor position.
 
+    BACKGROUND TARGETING: set `hwnd` or `window_title` to click a specific window
+    WITHOUT bringing it to the foreground (Win32 PostMessage). In that mode x/y are
+    client coordinates of the target window and the deepest child control at that
+    point receives the click.
+
     Args:
-        params (ClickInput): position, button, click count and interval.
+        params (ClickInput): position, button, click count, interval, optional target.
 
     Returns:
         str: JSON describing the click that was performed.
     """
+    # Background / unfocused window targeting
+    if params.hwnd is not None or params.window_title:
+        if (e := _require(winio, "winio (Windows)")):
+            return e
+        if params.x is None or params.y is None:
+            return _err("Background click requires explicit client x and y coordinates.")
+        try:
+            top = winio.find_top_window(params.window_title, params.hwnd)
+            res = winio.send_click(
+                top, params.x, params.y, button=params.button.value, double=params.clicks >= 2
+            )
+            return _ok(mode="background", window_hwnd=top, **res)
+        except winio.WinIOError as exc:
+            return _err(str(exc))
+
     if (e := _require(pyautogui, "pyautogui")):
         return e
     kwargs: dict[str, Any] = {
@@ -502,6 +542,14 @@ class TypeInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(..., description="Text to type at the current focus", min_length=1)
     interval: float = Field(default=0.0, description="Seconds between keystrokes", ge=0, le=2)
+    hwnd: Optional[int] = Field(
+        default=None,
+        description="BACKGROUND TARGET: window/control handle. Text is posted via WM_CHAR "
+        "to that window's focused control WITHOUT focusing the window.",
+    )
+    window_title: Optional[str] = Field(
+        default=None, description="BACKGROUND TARGET by title (substring) instead of a handle."
+    )
 
 
 @mcp.tool(
@@ -517,12 +565,27 @@ class TypeInput(BaseModel):
 async def type_text(params: TypeInput) -> str:
     """Type a string of text into the currently focused window/control.
 
+    BACKGROUND TARGETING: set `hwnd` or `window_title` to deliver the text to a
+    specific window WITHOUT focusing it (Win32 WM_CHAR to its focused control).
+    For edit controls, `win_set_control_text` is more reliable.
+
     Args:
-        params (TypeInput): the text and optional per-key interval.
+        params (TypeInput): the text, optional per-key interval, optional target.
 
     Returns:
         str: JSON confirming how many characters were typed.
     """
+    if params.hwnd is not None or params.window_title:
+        if (e := _require(winio, "winio (Windows)")):
+            return e
+        try:
+            top = winio.find_top_window(params.window_title, params.hwnd)
+            target = winio.focused_control(top)
+            res = winio.send_text(target, params.text)
+            return _ok(mode="background", window_hwnd=top, **res)
+        except winio.WinIOError as exc:
+            return _err(str(exc))
+
     if (e := _require(pyautogui, "pyautogui")):
         return e
     pyautogui.typewrite(params.text, interval=params.interval)
@@ -1050,6 +1113,17 @@ class ScreenshotInput(BaseModel):
     output_path: Optional[str] = Field(
         default=None, description="Where to save the PNG; auto-generated in the capture dir if omitted"
     )
+    hwnd: Optional[int] = Field(
+        default=None,
+        description="BACKGROUND CAPTURE: capture this specific window via PrintWindow, even if "
+        "it is unfocused, occluded by other windows, or on an off-screen desktop.",
+    )
+    window_title: Optional[str] = Field(
+        default=None, description="BACKGROUND CAPTURE by window title (substring) instead of a handle."
+    )
+    client_only: bool = Field(
+        default=False, description="For window capture: capture only the client area (no title bar/borders)."
+    )
 
 
 @mcp.tool(
@@ -1065,12 +1139,40 @@ class ScreenshotInput(BaseModel):
 async def screenshot(params: ScreenshotInput) -> str:
     """Capture a screenshot of a monitor (or a pixel region) and save it as PNG.
 
+    BACKGROUND CAPTURE: set `hwnd` or `window_title` to capture one specific window
+    via Win32 PrintWindow - this works even when the window is NOT focused, is hidden
+    behind other windows, or runs on an off-screen/headless desktop.
+
     Args:
-        params (ScreenshotInput): monitor index, optional region and output path.
+        params (ScreenshotInput): monitor index, optional region, output path, optional
+            window target and client_only flag.
 
     Returns:
         str: JSON {"ok": true, "path": "...", "width": W, "height": H}.
     """
+    # Per-window background capture via PrintWindow
+    if params.hwnd is not None or params.window_title:
+        if (e := _require(winio, "winio (Windows)")):
+            return e
+        if (e := _require(Image, "pillow")):
+            return e
+        out = (
+            Path(params.output_path)
+            if params.output_path
+            else _capture_dir() / f"window-{_timestamp()}.png"
+        )
+        out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            top = winio.find_top_window(params.window_title, params.hwnd)
+            img, rendered = winio.capture_window(top, client_only=params.client_only)
+            img.save(out)
+            return _ok(
+                path=str(out), width=img.width, height=img.height,
+                mode="window", window_hwnd=top, rendered_ok=rendered,
+            )
+        except winio.WinIOError as exc:
+            return _err(str(exc))
+
     if (e := _require(mss, "mss")):
         return e
     out = Path(params.output_path) if params.output_path else _capture_dir() / f"screenshot-{_timestamp()}.png"
@@ -1310,6 +1412,267 @@ async def recording_status() -> str:
         frames=_recorder.frames,
         elapsed_seconds=elapsed,
     )
+
+
+# =========================================================================== #
+# WIN32 BACKGROUND INPUT + HEADLESS DESKTOP
+# =========================================================================== #
+class WinTargetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    hwnd: Optional[int] = Field(default=None, description="Native window handle (from list_windows)")
+    window_title: Optional[str] = Field(
+        default=None, description="Top-level window title substring (used if hwnd is omitted)"
+    )
+
+
+@mcp.tool(
+    name="list_child_windows",
+    annotations={
+        "title": "List Child Controls",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def list_child_windows(params: WinTargetInput) -> str:
+    """Enumerate the child controls of a window (class, text, client rect, handle).
+
+    Useful for finding the exact control handle to target with background input -
+    e.g. the 'Edit' control inside Notepad - and its position for background clicks.
+
+    Args:
+        params (WinTargetInput): the parent window by hwnd or title.
+
+    Returns:
+        str: JSON {"ok": true, "parent_hwnd": N, "count": N, "children": [
+             {handle, class, text, left, top, width, height, visible}, ...]}.
+             Coordinates are relative to the parent window's top-left.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        top = winio.find_top_window(params.window_title, params.hwnd)
+        children = winio.list_child_windows(top)
+        return _ok(parent_hwnd=top, count=len(children), children=children)
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+class WinSendKeysInput(WinTargetInput):
+    keys: list[str] = Field(
+        ...,
+        description="Key names to send via WM_KEYDOWN/UP, e.g. ['enter'] or ['ctrl','a']. "
+        "NOTE: message-based modifier combos are unreliable for apps that check physical "
+        "key state; prefer win_set_control_text for text entry.",
+        min_length=1,
+        max_length=6,
+    )
+
+
+@mcp.tool(
+    name="win_send_keys",
+    annotations={
+        "title": "Send Keys To Window (Background)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def win_send_keys(params: WinSendKeysInput) -> str:
+    """Post key presses to a specific window WITHOUT focusing it (Win32 messages).
+
+    Args:
+        params (WinSendKeysInput): target window plus key names.
+
+    Returns:
+        str: JSON confirming the keys posted to the resolved control.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        top = winio.find_top_window(params.window_title, params.hwnd)
+        target = params.hwnd if params.hwnd is not None else winio.focused_control(top)
+        res = winio.send_keys(target, params.keys)
+        return _ok(window_hwnd=top, **res)
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+class WinSetTextInput(WinTargetInput):
+    text: str = Field(..., description="Text to set on the control")
+
+
+@mcp.tool(
+    name="win_set_control_text",
+    annotations={
+        "title": "Set Control Text (Background)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def win_set_control_text(params: WinSetTextInput) -> str:
+    """Set a control's text directly via WM_SETTEXT (reliable, no focus needed).
+
+    Pass the control's `hwnd` (from list_child_windows) - e.g. the Edit control of
+    a background Notepad - to replace its text without bringing the window forward.
+
+    Args:
+        params (WinSetTextInput): target control by hwnd (preferred) or title, plus text.
+
+    Returns:
+        str: JSON {"ok": true, "target_hwnd": N, "text_len": N}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        target = (
+            params.hwnd if params.hwnd is not None else winio.find_top_window(params.window_title, None)
+        )
+        res = winio.set_control_text(target, params.text)
+        return _ok(**res)
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+class HeadlessDesktopInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(
+        default="LowLevelCUHeadless",
+        description="Name of the off-screen desktop",
+        min_length=1,
+        max_length=64,
+    )
+
+
+@mcp.tool(
+    name="create_headless_desktop",
+    annotations={
+        "title": "Create Headless Desktop",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def create_headless_desktop(params: HeadlessDesktopInput) -> str:
+    """Create an off-screen Win32 desktop for running GUI apps invisibly.
+
+    Apps launched on this desktop have a real GUI (so they run and can be automated
+    and captured via PrintWindow) but never appear on the visible desktop. This is
+    the 'headless but with GUI' mode.
+
+    Args:
+        params (HeadlessDesktopInput): desktop name.
+
+    Returns:
+        str: JSON {"ok": true, "name": "...", "handle": N, "full": "WinSta0\\\\..."}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        return _ok(**winio.create_desktop(params.name))
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+class LaunchHeadlessInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(default="LowLevelCUHeadless", description="Off-screen desktop name", min_length=1)
+    command: str = Field(..., description="Command line of the GUI app to launch (e.g. 'notepad.exe')", min_length=1)
+
+
+@mcp.tool(
+    name="launch_on_headless_desktop",
+    annotations={
+        "title": "Launch App On Headless Desktop",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def launch_on_headless_desktop(params: LaunchHeadlessInput) -> str:
+    """Launch a GUI application on an off-screen desktop (creates it if needed).
+
+    The process runs with a full GUI on the hidden desktop. Use list_headless_windows
+    to find its windows, then drive them with background input and capture them with
+    screenshot(hwnd=...). The visible desktop is never touched.
+
+    Args:
+        params (LaunchHeadlessInput): desktop name and command line.
+
+    Returns:
+        str: JSON {"ok": true, "desktop": "...", "pid": N, "command": "..."}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        return _ok(**winio.launch_on_desktop(params.name, params.command))
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+@mcp.tool(
+    name="list_headless_windows",
+    annotations={
+        "title": "List Headless Desktop Windows",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def list_headless_windows(params: HeadlessDesktopInput) -> str:
+    """List the top-level windows living on an off-screen desktop.
+
+    Args:
+        params (HeadlessDesktopInput): desktop name.
+
+    Returns:
+        str: JSON {"ok": true, "name": "...", "count": N, "windows": [
+             {handle, title, class, width, height}, ...]}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        wins = winio.list_desktop_windows(params.name)
+        return _ok(name=params.name, count=len(wins), windows=wins)
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+@mcp.tool(
+    name="close_headless_desktop",
+    annotations={
+        "title": "Close Headless Desktop",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def close_headless_desktop(params: HeadlessDesktopInput) -> str:
+    """Release this server's handle to an off-screen desktop.
+
+    The desktop is fully freed by Windows once no process is still running on it,
+    so close any apps you launched there first.
+
+    Args:
+        params (HeadlessDesktopInput): desktop name.
+
+    Returns:
+        str: JSON {"ok": true, "name": "...", "closed": bool}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        return _ok(**winio.close_desktop(params.name))
+    except winio.WinIOError as exc:
+        return _err(str(exc))
 
 
 # =========================================================================== #
