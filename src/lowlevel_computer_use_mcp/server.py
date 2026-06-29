@@ -96,6 +96,22 @@ try:
 except Exception:  # pragma: no cover
     wslio = None
 
+# Linux (X11) backend: window mgmt, background input, capture, Xvfb
+try:
+    from . import linuxio
+except Exception:  # pragma: no cover
+    linuxio = None
+
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def _linux_env(display: Optional[int]):
+    """Build an env dict pinned to an X display number (e.g. an Xvfb :99), or None."""
+    if display is None:
+        return None
+    return {**os.environ, "DISPLAY": f":{display}"}
+
 
 # --------------------------------------------------------------------------- #
 # Server + constants
@@ -127,6 +143,14 @@ the exact tool calls in order (with concrete hwnd/title resolution steps, not
 hard-coded handles, since handles change per launch), notes verification
 screenshots, and parameterizes the parts that vary (text to type, file to open).
 Prefer background-targeting tools in macros so replays don't steal focus.
+
+CROSS-PLATFORM: these tools work on Windows AND Linux. On Linux, window targeting,
+background input and per-window capture use X11 (xdotool/wmctrl/ImageMagick);
+`hwnd` is the X11 window id. The Linux 'headless with GUI' is an Xvfb virtual
+display (create_virtual_display -> launch_on_virtual_display -> drive with the
+`display` field on click/type/screenshot -> stop_virtual_display). On a Windows
+host you can also spin up a throwaway Linux box with wsl_create_temp / wsl_run /
+wsl_destroy to run Linux software on demand.
 """
 
 mcp = FastMCP("computer_use_mcp", instructions=SERVER_INSTRUCTIONS)
@@ -444,6 +468,9 @@ class ClickInput(BaseModel):
         description="BACKGROUND TARGET by title (substring). Like hwnd but resolves the "
         "top-level window by title; x/y are client coordinates of that window.",
     )
+    display: Optional[int] = Field(
+        default=None, description="Linux only: X display number of the target window (e.g. Xvfb 99)"
+    )
 
 
 @mcp.tool(
@@ -475,10 +502,22 @@ async def mouse_click(params: ClickInput) -> str:
     """
     # Background / unfocused window targeting
     if params.hwnd is not None or params.window_title:
-        if (e := _require(winio, "winio (Windows)")):
-            return e
         if params.x is None or params.y is None:
             return _err("Background click requires explicit client x and y coordinates.")
+        if IS_LINUX:
+            if (e := _require(linuxio, "linuxio")):
+                return e
+            try:
+                env = _linux_env(params.display)
+                wid = linuxio.find_window(params.window_title, params.hwnd, env=env)
+                res = linuxio.send_click(
+                    wid, params.x, params.y, button=params.button.value, double=params.clicks >= 2, env=env
+                )
+                return _ok(mode="background", window_hwnd=wid, **res)
+            except linuxio.LinuxIOError as exc:
+                return _err(str(exc))
+        if (e := _require(winio, "winio (Windows)")):
+            return e
         try:
             top = winio.find_top_window(params.window_title, params.hwnd)
             res = winio.send_click(
@@ -591,6 +630,9 @@ class TypeInput(BaseModel):
     window_title: Optional[str] = Field(
         default=None, description="BACKGROUND TARGET by title (substring) instead of a handle."
     )
+    display: Optional[int] = Field(
+        default=None, description="Linux only: X display number of the target window (e.g. Xvfb 99)"
+    )
 
 
 @mcp.tool(
@@ -617,6 +659,16 @@ async def type_text(params: TypeInput) -> str:
         str: JSON confirming how many characters were typed.
     """
     if params.hwnd is not None or params.window_title:
+        if IS_LINUX:
+            if (e := _require(linuxio, "linuxio")):
+                return e
+            try:
+                env = _linux_env(params.display)
+                wid = linuxio.find_window(params.window_title, params.hwnd, env=env)
+                res = linuxio.send_text(wid, params.text, env=env)
+                return _ok(mode="background", window_hwnd=wid, **res)
+            except linuxio.LinuxIOError as exc:
+                return _err(str(exc))
         if (e := _require(winio, "winio (Windows)")):
             return e
         try:
@@ -805,6 +857,14 @@ async def list_windows(params: ListWindowsInput) -> str:
         str: JSON {"ok": true, "count": N, "windows": [{title, handle, left, top,
              width, height, is_minimized, is_maximized, is_active}, ...]}.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            wins = linuxio.list_windows(params.title_filter, params.include_empty_titles)
+            return _ok(count=len(wins), windows=wins)
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(gw, "pygetwindow")):
         return e
     windows = gw.getAllWindows()
@@ -835,6 +895,13 @@ async def get_active_window() -> str:
         str: JSON with the active window's title, handle, position and size,
              or {"ok": true, "window": null} if none is active.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            return _ok(window=linuxio.get_active_window())
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(gw, "pygetwindow")):
         return e
     win = gw.getActiveWindow()
@@ -847,7 +914,10 @@ class WindowTargetInput(BaseModel):
         default=None, description="Window title (case-insensitive substring match)"
     )
     handle: Optional[int] = Field(
-        default=None, description="Exact native window handle (HWND) from list_windows"
+        default=None, description="Exact native window handle (HWND) / X11 window id from list_windows"
+    )
+    display: Optional[int] = Field(
+        default=None, description="Linux only: target a specific X display number (e.g. Xvfb 99)"
     )
 
 
@@ -877,6 +947,15 @@ async def move_window(params: MoveWindowInput) -> str:
     Returns:
         str: JSON with the window's updated geometry, or an error if not found.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            env = _linux_env(params.display)
+            wid = linuxio.find_window(params.title, params.handle, env=env)
+            return _ok(window=linuxio.move_window(wid, params.x, params.y, env=env))
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(gw, "pygetwindow")):
         return e
     win = _find_window(params.title, params.handle)
@@ -913,6 +992,15 @@ async def resize_window(params: ResizeWindowInput) -> str:
     Returns:
         str: JSON with the window's updated geometry, or an error if not found.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            env = _linux_env(params.display)
+            wid = linuxio.find_window(params.title, params.handle, env=env)
+            return _ok(window=linuxio.resize_window(wid, params.width, params.height, env=env))
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(gw, "pygetwindow")):
         return e
     win = _find_window(params.title, params.handle)
@@ -959,6 +1047,15 @@ async def window_action(params: WindowActionInput) -> str:
     Returns:
         str: JSON confirming the action, or an error if the window was not found.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            env = _linux_env(params.display)
+            wid = linuxio.find_window(params.title, params.handle, env=env)
+            return _ok(**linuxio.window_action(wid, params.action.value, env=env))
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(gw, "pygetwindow")):
         return e
     win = _find_window(params.title, params.handle)
@@ -1165,6 +1262,9 @@ class ScreenshotInput(BaseModel):
     client_only: bool = Field(
         default=False, description="For window capture: capture only the client area (no title bar/borders)."
     )
+    display: Optional[int] = Field(
+        default=None, description="Linux only: X display number of the target window (e.g. Xvfb 99)"
+    )
 
 
 @mcp.tool(
@@ -1191,10 +1291,8 @@ async def screenshot(params: ScreenshotInput) -> str:
     Returns:
         str: JSON {"ok": true, "path": "...", "width": W, "height": H}.
     """
-    # Per-window background capture via PrintWindow
+    # Per-window background capture
     if params.hwnd is not None or params.window_title:
-        if (e := _require(winio, "winio (Windows)")):
-            return e
         if (e := _require(Image, "pillow")):
             return e
         out = (
@@ -1203,6 +1301,20 @@ async def screenshot(params: ScreenshotInput) -> str:
             else _capture_dir() / f"window-{_timestamp()}.png"
         )
         out.parent.mkdir(parents=True, exist_ok=True)
+        if IS_LINUX:
+            if (e := _require(linuxio, "linuxio")):
+                return e
+            try:
+                env = _linux_env(params.display)
+                wid = linuxio.find_window(params.window_title, params.hwnd, env=env)
+                img, rendered = linuxio.capture_window(wid, client_only=params.client_only, env=env)
+                img.save(out)
+                return _ok(path=str(out), width=img.width, height=img.height,
+                           mode="window", window_hwnd=wid, rendered_ok=rendered)
+            except linuxio.LinuxIOError as exc:
+                return _err(str(exc))
+        if (e := _require(winio, "winio (Windows)")):
+            return e
         try:
             top = winio.find_top_window(params.window_title, params.hwnd)
             img, rendered = winio.capture_window(top, client_only=params.client_only)
@@ -1460,9 +1572,13 @@ async def recording_status() -> str:
 # =========================================================================== #
 class WinTargetInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    hwnd: Optional[int] = Field(default=None, description="Native window handle (from list_windows)")
+    hwnd: Optional[int] = Field(default=None, description="Native window handle / X11 window id (from list_windows)")
     window_title: Optional[str] = Field(
         default=None, description="Top-level window title substring (used if hwnd is omitted)"
+    )
+    display: Optional[int] = Field(
+        default=None,
+        description="Linux only: target a specific X display number (e.g. an Xvfb virtual display 99)",
     )
 
 
@@ -1490,6 +1606,16 @@ async def list_child_windows(params: WinTargetInput) -> str:
              {handle, class, text, left, top, width, height, visible}, ...]}.
              Coordinates are relative to the parent window's top-left.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            env = _linux_env(params.display)
+            wid = linuxio.find_window(params.window_title, params.hwnd, env=env)
+            children = linuxio.list_child_windows(wid, env=env)
+            return _ok(parent_hwnd=wid, count=len(children), children=children)
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(winio, "winio (Windows)")):
         return e
     try:
@@ -1530,6 +1656,16 @@ async def win_send_keys(params: WinSendKeysInput) -> str:
     Returns:
         str: JSON confirming the keys posted to the resolved control.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            env = _linux_env(params.display)
+            wid = linuxio.find_window(params.window_title, params.hwnd, env=env)
+            res = linuxio.send_keys(wid, params.keys, env=env)
+            return _ok(window_hwnd=wid, **res)
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(winio, "winio (Windows)")):
         return e
     try:
@@ -1567,6 +1703,15 @@ async def win_set_control_text(params: WinSetTextInput) -> str:
     Returns:
         str: JSON {"ok": true, "target_hwnd": N, "text_len": N}.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            env = _linux_env(params.display)
+            wid = params.hwnd if params.hwnd is not None else linuxio.find_window(params.window_title, None, env=env)
+            return _ok(**linuxio.set_control_text(wid, params.text, env=env))
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(winio, "winio (Windows)")):
         return e
     try:
@@ -1742,6 +1887,15 @@ async def show_window(params: WinTargetInput) -> str:
     Returns:
         str: JSON {"ok": true, "hwnd": N, "visible": true}.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            env = _linux_env(params.display)
+            wid = linuxio.find_window(params.window_title, params.hwnd, env=env)
+            return _ok(**linuxio.show_window(wid, env=env))
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(winio, "winio (Windows)")):
         return e
     try:
@@ -1777,6 +1931,15 @@ async def hide_window(params: HideWindowInput) -> str:
     Returns:
         str: JSON {"ok": true, "hwnd": N, "visible": false}.
     """
+    if IS_LINUX:
+        if (e := _require(linuxio, "linuxio")):
+            return e
+        try:
+            env = _linux_env(params.display)
+            wid = linuxio.find_window(params.window_title, params.hwnd, env=env)
+            return _ok(**linuxio.hide_window(wid, minimize=params.minimize, env=env))
+        except linuxio.LinuxIOError as exc:
+            return _err(str(exc))
     if (e := _require(winio, "winio (Windows)")):
         return e
     try:
@@ -1951,6 +2114,201 @@ async def ahk_control_send(params: AhkControlSendInput) -> str:
             )
         )
     except ahk_addon.AhkError as exc:
+        return _err(str(exc))
+
+
+# =========================================================================== #
+# LINUX VIRTUAL DISPLAY (Xvfb headless-but-with-GUI)
+# =========================================================================== #
+@mcp.tool(
+    name="linux_status",
+    annotations={
+        "title": "Linux Automation Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def linux_status() -> str:
+    """Report Linux X11 automation tooling availability (xdotool, wmctrl, Xvfb, …).
+
+    Returns:
+        str: JSON {"ok": true, "display": ":0", "session_type": "x11", "xdotool": bool, ...}.
+    """
+    if (e := _require(linuxio, "linuxio")):
+        return e
+    return _ok(**linuxio.available())
+
+
+class CreateVirtualDisplayInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    display: int = Field(default=99, description="Display number, e.g. 99 → ':99'", ge=1, le=9999)
+    width: int = Field(default=1280, description="Virtual screen width", ge=16, le=16384)
+    height: int = Field(default=800, description="Virtual screen height", ge=16, le=16384)
+    depth: int = Field(default=24, description="Color depth", ge=8, le=32)
+
+
+@mcp.tool(
+    name="create_virtual_display",
+    annotations={
+        "title": "Create Virtual Display (Xvfb)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def create_virtual_display(params: CreateVirtualDisplayInput) -> str:
+    """Start an Xvfb virtual display — the Linux 'headless but with GUI' mode.
+
+    GUI apps launched on it run with a real X server but no physical screen, so they
+    can be automated (xdotool) and screenshotted (mss) without occupying the visible
+    desktop. The Linux counterpart of the Windows headless desktop.
+
+    Args:
+        params (CreateVirtualDisplayInput): display number, width, height, depth.
+
+    Returns:
+        str: JSON {"ok": true, "display": ":99", "size": "1280x800x24", "pid": N}.
+    """
+    if (e := _require(linuxio, "linuxio")):
+        return e
+    try:
+        return _ok(**linuxio.create_virtual_display(params.display, params.width, params.height, params.depth))
+    except linuxio.LinuxIOError as exc:
+        return _err(str(exc))
+
+
+class LaunchVirtualInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    display: int = Field(default=99, description="Xvfb display number to launch on", ge=1, le=9999)
+    command: str = Field(..., description="Command line of the GUI app to launch", min_length=1)
+
+
+@mcp.tool(
+    name="launch_on_virtual_display",
+    annotations={
+        "title": "Launch App On Virtual Display",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def launch_on_virtual_display(params: LaunchVirtualInput) -> str:
+    """Launch a GUI app on an Xvfb virtual display (creates it if needed).
+
+    Args:
+        params (LaunchVirtualInput): display number and command line.
+
+    Returns:
+        str: JSON {"ok": true, "display": ":99", "pid": N, "command": "..."}.
+    """
+    if (e := _require(linuxio, "linuxio")):
+        return e
+    try:
+        return _ok(**linuxio.launch_on_virtual_display(params.display, params.command))
+    except linuxio.LinuxIOError as exc:
+        return _err(str(exc))
+
+
+class VirtualDisplayInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    display: int = Field(default=99, description="Xvfb display number", ge=1, le=9999)
+
+
+@mcp.tool(
+    name="list_virtual_display_windows",
+    annotations={
+        "title": "List Virtual Display Windows",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def list_virtual_display_windows(params: VirtualDisplayInput) -> str:
+    """List the windows present on an Xvfb virtual display.
+
+    Args:
+        params (VirtualDisplayInput): display number.
+
+    Returns:
+        str: JSON {"ok": true, "count": N, "windows": [...]}.
+    """
+    if (e := _require(linuxio, "linuxio")):
+        return e
+    try:
+        wins = linuxio.list_virtual_display_windows(params.display)
+        return _ok(display=f":{params.display}", count=len(wins), windows=wins)
+    except linuxio.LinuxIOError as exc:
+        return _err(str(exc))
+
+
+class ScreenshotVirtualInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    display: int = Field(default=99, description="Xvfb display number to capture", ge=1, le=9999)
+    output_path: Optional[str] = Field(default=None, description="Where to save the PNG")
+
+
+@mcp.tool(
+    name="screenshot_virtual_display",
+    annotations={
+        "title": "Screenshot Virtual Display",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def screenshot_virtual_display(params: ScreenshotVirtualInput) -> str:
+    """Capture the whole Xvfb virtual display to a PNG.
+
+    Args:
+        params (ScreenshotVirtualInput): display number and output path.
+
+    Returns:
+        str: JSON {"ok": true, "path": "...", "width": W, "height": H}.
+    """
+    if (e := _require(linuxio, "linuxio")):
+        return e
+    if (e := _require(Image, "pillow")):
+        return e
+    out = Path(params.output_path) if params.output_path else _capture_dir() / f"xvfb-{_timestamp()}.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        img = linuxio.capture_virtual_display(params.display)
+        img.save(out)
+        return _ok(path=str(out), width=img.width, height=img.height, display=f":{params.display}")
+    except linuxio.LinuxIOError as exc:
+        return _err(str(exc))
+
+
+@mcp.tool(
+    name="stop_virtual_display",
+    annotations={
+        "title": "Stop Virtual Display",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def stop_virtual_display(params: VirtualDisplayInput) -> str:
+    """Stop an Xvfb virtual display and terminate the apps launched on it.
+
+    Args:
+        params (VirtualDisplayInput): display number.
+
+    Returns:
+        str: JSON {"ok": true, "display": ":99", "stopped": true}.
+    """
+    if (e := _require(linuxio, "linuxio")):
+        return e
+    try:
+        return _ok(**linuxio.stop_virtual_display(params.display))
+    except linuxio.LinuxIOError as exc:
         return _err(str(exc))
 
 

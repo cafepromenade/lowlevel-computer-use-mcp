@@ -17,6 +17,8 @@ Codex, Claude Desktop, etc. — as a set of well-described tools:
 - 🛡️ **Run-as-admin** — per-command UAC elevation or whole-server elevation
 - 🚀 **Auto-start on boot** — register a logon scheduled task (optionally as admin)
 - 🟢 **AutoHotkey add-in** — run AHK scripts; `ControlSend`/`ControlClick` for rock-solid background input
+- 🐧 **Cross-platform** — the same tools work natively on **Linux** (X11 via xdotool/wmctrl), with **Xvfb** virtual displays for headless-with-GUI
+- 🌀 **Ephemeral WSL** — on a Windows host, spin up a throwaway Linux distro on demand, run commands, tear it down
 - 🧩 **GUI installer** — one window that installs everything automatically
 
 > ⚠️ **This server performs real, unsandboxed actions on the host machine** —
@@ -61,6 +63,16 @@ Codex, Claude Desktop, etc. — as a set of well-described tools:
 | `is_admin` | Whether the server is running elevated |
 | `run_command_as_admin` | Run a shell command elevated (UAC prompt) |
 | `install_startup` / `uninstall_startup` / `startup_status` | Boot auto-start |
+| `linux_status` | Linux: X11 automation tooling availability |
+| `create_virtual_display` | Linux: start an Xvfb headless display |
+| `launch_on_virtual_display` | Linux: launch a GUI app on the Xvfb display |
+| `list_virtual_display_windows` | Linux: windows on the Xvfb display |
+| `screenshot_virtual_display` | Linux: capture the whole Xvfb display |
+| `stop_virtual_display` | Linux: stop the Xvfb display |
+| `wsl_status` / `wsl_list_distros` | WSL availability + installed distros |
+| `wsl_create_temp` | Provision a throwaway WSL distro (Alpine by default) |
+| `wsl_run` | Run a command inside a WSL distro |
+| `wsl_list_temp` / `wsl_destroy` / `wsl_destroy_all_temp` | Manage throwaway distros |
 
 Every tool returns a JSON string `{"ok": true, ...}` on success or
 `{"ok": false, "error": "..."}` on failure.
@@ -304,6 +316,113 @@ variable parts, verify with a screenshot).
 
 ---
 
+## Linux (native X11)
+
+The mouse, keyboard, screenshot, process, recording, **window management** and
+**background/unfocused targeting** tools all work natively on Linux. Window control,
+background input and per-window capture use X11 CLI tools; on Linux `hwnd` is an X11
+window id.
+
+Install the X11 helpers (Debian/Ubuntu):
+
+```bash
+sudo apt install xdotool wmctrl x11-utils imagemagick xvfb
+```
+
+Check what the server can see:
+
+```jsonc
+linux_status {}
+```
+
+Background-type into a window without focusing it (X11):
+
+```jsonc
+type_text { "window_title": "Editor", "text": "typed in the background" }
+```
+
+> Caveat: X11 background typing uses `XSendEvent`; most apps accept it, but a few
+> (notably `xterm` with its default `allowSendEvents: false`) ignore synthetic
+> events. For those, focus the window first or use a real X session.
+
+### Headless-with-GUI on Linux (Xvfb)
+
+Start a virtual display:
+
+```jsonc
+create_virtual_display { "display": 99, "width": 1280, "height": 800 }
+```
+
+Launch a GUI app onto it:
+
+```jsonc
+launch_on_virtual_display { "display": 99, "command": "xterm -e bash" }
+```
+
+List its windows:
+
+```jsonc
+list_virtual_display_windows { "display": 99 }
+```
+
+Drive a window on that display (note the `display` field routes input there):
+
+```jsonc
+type_text { "hwnd": 2097164, "display": 99, "text": "hello from headless" }
+```
+
+Capture the whole virtual display:
+
+```jsonc
+screenshot_virtual_display { "display": 99 }
+```
+
+Stop it when done:
+
+```jsonc
+stop_virtual_display { "display": 99 }
+```
+
+---
+
+## Ephemeral WSL (Linux on a Windows host)
+
+On Windows, spin up a throwaway Linux distro on demand to run Linux software, then
+tear it down. By default a tiny Alpine minirootfs is downloaded and imported in
+seconds — your existing distros are untouched.
+
+Check WSL is available:
+
+```jsonc
+wsl_status {}
+```
+
+Provision a throwaway distro (downloads latest Alpine minirootfs):
+
+```jsonc
+wsl_create_temp {}
+```
+
+Run a command in it (use the name returned above):
+
+```jsonc
+wsl_run { "distro": "llcu-tmp-1782754365-53b8", "command": "apk add --no-cache curl && curl --version" }
+```
+
+Tear it down (irreversible — deletes the distro):
+
+```jsonc
+wsl_destroy { "name": "llcu-tmp-1782754365-53b8" }
+```
+
+You can also clone an existing distro instead of downloading:
+
+```jsonc
+wsl_create_temp { "clone_from": "Ubuntu-24.04" }
+```
+
+---
+
 ## Run-as-admin mode
 
 Per-command elevation — call `run_command_as_admin` (UAC prompt unless already
@@ -375,9 +494,13 @@ desktop-automation tools keep access to your session.
 
 - **Python 3.10+**
 - **[uv](https://docs.astral.sh/uv/)** (recommended; the GUI installer can bootstrap it)
-- Windows is the primary target. Mouse/keyboard via `pyautogui`; windows via
-  `pygetwindow`; background input + capture + headless desktop via `ctypes`/Win32
-  (`winio.py`); screenshots via `mss`; recording via `imageio` + bundled ffmpeg.
+- **Windows**: mouse/keyboard via `pyautogui`; windows via `pygetwindow`; background
+  input + capture + headless desktop via `ctypes`/Win32 (`winio.py`); screenshots via
+  `mss`; recording via `imageio` + bundled ffmpeg. Optional: AutoHotkey, WSL.
+- **Linux**: mouse/keyboard via `pyautogui` (X11); window mgmt, background input and
+  per-window capture via `xdotool`/`wmctrl`/`x11-utils`/ImageMagick (`linuxio.py`);
+  headless-with-GUI via `Xvfb`; screenshots/recording via `mss`. Install the X11
+  helpers with your package manager (see the Linux section). X11 (or XWayland) session.
 
 ## Safety notes
 
