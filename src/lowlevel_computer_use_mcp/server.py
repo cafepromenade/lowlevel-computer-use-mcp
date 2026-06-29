@@ -90,6 +90,12 @@ try:
 except Exception:  # pragma: no cover
     ahk_addon = None
 
+# Ephemeral WSL provisioning (Windows host only; pure-stdlib import)
+try:
+    from . import wslio
+except Exception:  # pragma: no cover
+    wslio = None
+
 
 # --------------------------------------------------------------------------- #
 # Server + constants
@@ -1946,6 +1952,223 @@ async def ahk_control_send(params: AhkControlSendInput) -> str:
         )
     except ahk_addon.AhkError as exc:
         return _err(str(exc))
+
+
+# =========================================================================== #
+# EPHEMERAL WSL (Linux on a Windows host, on demand)
+# =========================================================================== #
+@mcp.tool(
+    name="wsl_status",
+    annotations={
+        "title": "WSL Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wsl_status() -> str:
+    """Report whether WSL is available on this Windows host.
+
+    Returns:
+        str: JSON {"ok": true, "available": bool, "version": "...", ...}.
+    """
+    if (e := _require(wslio, "wslio")):
+        return e
+    return _ok(**wslio.available())
+
+
+@mcp.tool(
+    name="wsl_list_distros",
+    annotations={
+        "title": "List WSL Distros",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wsl_list_distros() -> str:
+    """List installed WSL distros with state, version and default flag.
+
+    Returns:
+        str: JSON {"ok": true, "count": N, "distros": [{name, state, version, default}, ...]}.
+    """
+    if (e := _require(wslio, "wslio")):
+        return e
+    try:
+        d = wslio.list_distros()
+        return _ok(count=len(d), distros=d)
+    except wslio.WslError as exc:
+        return _err(str(exc))
+
+
+class WslCreateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: Optional[str] = Field(
+        default=None, description="Name for the throwaway distro (auto-generated if omitted)"
+    )
+    rootfs_url: Optional[str] = Field(
+        default=None, description="URL of a rootfs .tar.gz to import (defaults to latest Alpine minirootfs)"
+    )
+    clone_from: Optional[str] = Field(
+        default=None, description="Instead of downloading, clone an existing distro by name (export+import)"
+    )
+    base_tar: Optional[str] = Field(
+        default=None, description="Path to a local rootfs .tar or .tar.gz to import"
+    )
+    timeout: float = Field(default=1800.0, description="Max seconds for provisioning", ge=10, le=7200)
+
+
+@mcp.tool(
+    name="wsl_create_temp",
+    annotations={
+        "title": "Create Throwaway WSL Distro",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def wsl_create_temp(params: WslCreateInput) -> str:
+    """Provision a throwaway WSL distro on demand for running Linux software.
+
+    By default downloads a tiny Alpine minirootfs (a few MB) and imports it, leaving
+    existing distros untouched. Use wsl_run to run commands in it and wsl_destroy to
+    tear it down. Alternatively clone_from an existing distro or import base_tar.
+
+    Args:
+        params (WslCreateInput): optional name, rootfs_url, clone_from, base_tar, timeout.
+
+    Returns:
+        str: JSON {"ok": true, "name": "...", "install_dir": "...", "source": "alpine"}.
+    """
+    if (e := _require(wslio, "wslio")):
+        return e
+    try:
+        return _ok(
+            **wslio.create_temp(
+                name=params.name, rootfs_url=params.rootfs_url,
+                clone_from=params.clone_from, base_tar=params.base_tar, timeout=params.timeout,
+            )
+        )
+    except wslio.WslError as exc:
+        return _err(str(exc))
+
+
+class WslRunInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    distro: str = Field(..., description="Distro name to run in (e.g. from wsl_create_temp)", min_length=1)
+    command: str = Field(..., description="Shell command to run inside the distro", min_length=1)
+    user: Optional[str] = Field(default=None, description="Run as this Linux user (default: distro default)")
+    cwd: Optional[str] = Field(default=None, description="Working directory inside the distro")
+    timeout: float = Field(default=120.0, description="Max seconds", ge=1, le=3600)
+
+
+@mcp.tool(
+    name="wsl_run",
+    annotations={
+        "title": "Run Command In WSL",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def wsl_run(params: WslRunInput) -> str:
+    """Run a shell command inside a WSL distro and capture stdout/stderr/exit code.
+
+    Args:
+        params (WslRunInput): distro, command, optional user, cwd and timeout.
+
+    Returns:
+        str: JSON {"ok": true, "distro": "...", "returncode": N, "stdout": "...", "stderr": "..."}.
+    """
+    if (e := _require(wslio, "wslio")):
+        return e
+    try:
+        res = wslio.run(params.distro, params.command, user=params.user, cwd=params.cwd, timeout=params.timeout)
+        return _ok(**res)
+    except wslio.WslError as exc:
+        return _err(str(exc))
+    except subprocess.TimeoutExpired:
+        return _err(f"WSL command timed out after {params.timeout}s")
+
+
+@mcp.tool(
+    name="wsl_list_temp",
+    annotations={
+        "title": "List Throwaway WSL Distros",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wsl_list_temp() -> str:
+    """List the throwaway distros this server session provisioned.
+
+    Returns:
+        str: JSON {"ok": true, "count": N, "distros": [{name, install_dir, source, created_at}, ...]}.
+    """
+    if (e := _require(wslio, "wslio")):
+        return e
+    t = wslio.list_temp()
+    return _ok(count=len(t), distros=t)
+
+
+class WslDestroyInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(..., description="Distro name to terminate and unregister", min_length=1)
+    remove_files: bool = Field(default=True, description="Also delete the distro's backing files")
+
+
+@mcp.tool(
+    name="wsl_destroy",
+    annotations={
+        "title": "Destroy WSL Distro",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wsl_destroy(params: WslDestroyInput) -> str:
+    """Terminate and unregister a WSL distro, deleting its files (irreversible).
+
+    Args:
+        params (WslDestroyInput): distro name and whether to delete files.
+
+    Returns:
+        str: JSON {"ok": true, "name": "...", "destroyed": true}.
+    """
+    if (e := _require(wslio, "wslio")):
+        return e
+    try:
+        return _ok(**wslio.destroy(params.name, remove_files=params.remove_files))
+    except wslio.WslError as exc:
+        return _err(str(exc))
+
+
+@mcp.tool(
+    name="wsl_destroy_all_temp",
+    annotations={
+        "title": "Destroy All Throwaway WSL Distros",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def wsl_destroy_all_temp() -> str:
+    """Tear down every throwaway distro provisioned in this session.
+
+    Returns:
+        str: JSON {"ok": true, "destroyed": [...], "count": N}.
+    """
+    if (e := _require(wslio, "wslio")):
+        return e
+    return _ok(**wslio.destroy_all())
 
 
 # =========================================================================== #
