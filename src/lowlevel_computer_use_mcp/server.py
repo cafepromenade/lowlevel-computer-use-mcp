@@ -698,12 +698,11 @@ async def mouse_drag(params: DragInput) -> str:
         return e
     if params.start_x is not None and params.start_y is not None:
         _smooth_mouse_move_to(params.start_x, params.start_y)
-    pyautogui.dragTo(
-        params.end_x,
-        params.end_y,
-        button=params.button.value,
-        duration=_smooth_duration(params.duration),
-    )
+    pyautogui.mouseDown(button=params.button.value)
+    try:
+        _smooth_mouse_move_to(params.end_x, params.end_y, duration=params.duration)
+    finally:
+        pyautogui.mouseUp(button=params.button.value)
     return _ok(end_x=params.end_x, end_y=params.end_y, button=params.button.value)
 
 
