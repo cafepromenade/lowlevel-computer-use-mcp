@@ -328,6 +328,11 @@ List its windows (to get handles):
 list_headless_windows { "name": "work" }
 ```
 
+Each returned window includes its `handle`, `process_id`, `thread_id`, `dpi`,
+`title`, `class`, `width`, and `height`. Identity and DPI are sampled inside the
+desktop enumeration callback; an unavailable value is reported as `0` without
+omitting the window.
+
 Capture a window on it (works even though it's off-screen):
 
 ```jsonc

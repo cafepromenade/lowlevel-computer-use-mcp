@@ -1949,7 +1949,7 @@ async def list_headless_windows(params: HeadlessDesktopInput) -> str:
 
     Returns:
         str: JSON {"ok": true, "name": "...", "count": N, "windows": [
-             {handle, title, class, width, height}, ...]}.
+             {handle, process_id, thread_id, dpi, title, class, width, height}, ...]}.
     """
     if (e := _require(winio, "winio (Windows)")):
         return e

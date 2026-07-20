@@ -194,7 +194,9 @@ No params. → `{ok, recording, path, frames, elapsed_seconds}`.
 - `name` str, `*command` str. → `{ok, desktop, pid, command}`.
 
 ### `list_headless_windows` (W)
-- `name` str. → `{ok, name, count, windows:[{handle, title, class, width, height}]}`.
+- `name` str. → `{ok, name, count, windows:[{handle, process_id, thread_id, dpi, title, class, width, height}]}`.
+- Identity and DPI are sampled during desktop enumeration. Unavailable values are
+  returned as `0`; the window remains in the list.
 
 ### `close_headless_desktop` (W, destructive)
 - `name` str. Close apps on it first. → `{ok, name, closed}`.

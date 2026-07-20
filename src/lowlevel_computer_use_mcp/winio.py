@@ -107,6 +107,8 @@ user32.IsWindow.argtypes = [HWND]
 user32.IsWindowVisible.argtypes = [HWND]
 user32.GetWindowThreadProcessId.argtypes = [HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetDpiForWindow.argtypes = [HWND]
+user32.GetDpiForWindow.restype = wintypes.UINT
 user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 user32.MapVirtualKeyW.restype = wintypes.UINT
 user32.VkKeyScanW.argtypes = [wintypes.WCHAR]
@@ -512,12 +514,20 @@ def list_desktop_windows(name: str) -> list[dict[str, Any]]:
 
     @WNDENUMPROC
     def cb(hwnd, _lparam):
+        # Resolve identity while the HWND is valid in this desktop's enumeration
+        # callback. A caller attached to another desktop may not be able to query it.
+        process_id = wintypes.DWORD()
+        thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        dpi = user32.GetDpiForWindow(hwnd)
         text = _get_window_text(hwnd)
         r = wintypes.RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(r))
         out.append(
             {
                 "handle": int(hwnd),
+                "process_id": int(process_id.value),
+                "thread_id": int(thread_id),
+                "dpi": int(dpi),
                 "title": text,
                 "class": _get_class_name(hwnd),
                 "width": r.right - r.left,
